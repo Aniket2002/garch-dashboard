@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{{ title }}</title>
+  <style>
+    body { font-family: sans-serif; margin: 40px; }
+    h1 { text-align: center; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: center; }
+  </style>
+</head>
+<body>
+  <h1>{{ title }}</h1>
+  <p><strong>Period:</strong> {{ start_date }} – {{ end_date }}</p>
+  <h2>Backtest Summary</h2>
+  <ul>
+    <li>Total days: {{ stats.total_days }}</li>
+    <li>VaR breaches: {{ stats.breaches }}</li>
+    <li>Breach hit rate: {{ (stats.hit_rate * 100) | round(2) }}%</li>
+  </ul>
+  <h2>Plots</h2>
+  <img src="data:image/png;base64,{{ plot_volatility }}" alt="Volatility over time"/>
+  <img src="data:image/png;base64,{{ plot_var }}" alt="VaR over time"/>
+</body>
+</html>

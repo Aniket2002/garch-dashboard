@@ -1,9 +1,10 @@
 pandas
 numpy
-yfinance
+python-dotenv
+requests
 arch
-scipy
-matplotlib
-plotly
 streamlit
+plotly
 weasyprint
+jinja2
+logger
