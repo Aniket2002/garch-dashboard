@@ -1,96 +1,287 @@
-import logging
-import pandas as pd
-import numpy as np
-from scipy.stats import norm, chi2
-from models.garch_model import fit_garch, forecast_variance
+from __future__ import annotations
 
-logger = logging.getLogger(__name__)
+import math
+from collections.abc import Callable
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from scipy.stats import chi2
+
+from models.garch_model import GarchSpec, RiskForecast, fit_garch, forecast_tail_risk
+
+
+class BacktestError(RuntimeError):
+    """Raised when a walk-forward model fit or forecast fails."""
+
+
+RiskForecaster = Callable[[pd.Series, float, GarchSpec], RiskForecast]
+ProgressCallback = Callable[[int, int], None]
+
+
+def _default_forecaster(
+    training_returns: pd.Series,
+    alpha: float,
+    spec: GarchSpec,
+) -> RiskForecast:
+    result = fit_garch(training_returns, spec)
+    return forecast_tail_risk(result, alpha)
+
+
+def _empty_backtest() -> pd.DataFrame:
+    frame = pd.DataFrame(
+        columns=[
+            "realized_return",
+            "conditional_mean",
+            "variance",
+            "volatility",
+            "var",
+            "expected_shortfall",
+            "breach",
+            "es_breach",
+        ]
+    )
+    frame.index = pd.DatetimeIndex([], name="date")
+    return frame
+
 
 def run_backtest(
     returns: pd.Series,
+    *,
     window: int = 250,
     alpha: float = 0.05,
-    p: int = 1,
-    q: int = 1,
+    spec: GarchSpec | None = None,
+    forecaster: RiskForecaster | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> pd.DataFrame:
+    """Run a strict one-step-ahead rolling GARCH VaR/ES backtest.
+
+    For forecast date ``t``, the estimation sample ends at ``t-1``. The
+    realized return at ``t`` is never included in its own model fit.
     """
-    Walk-forward backtest of parametric GARCH VaR/ES.
-    Returns columns: [mu, sigma, sigma2, var, es, breach, es_breach, ret].
-    VaR/ES are return-space thresholds (typically negative).
-    """
-    logger.info(f"run_backtest: window={window}, alpha={alpha}, p={p}, q={q}, points={len(returns)}")
-    records = []
 
-    for t in range(window, len(returns)):
-        train = returns.iloc[t - window : t]
-        res = fit_garch(train, p=p, q=q)
-        sigma2 = forecast_variance(res)
-        sigma = np.sqrt(max(sigma2, 0.0))
-        mu = float(train.mean())
+    if not isinstance(returns, pd.Series):
+        raise TypeError("returns must be a pandas Series")
+    if window < 50:
+        raise ValueError("window must be at least 50 observations")
+    if not 0 < alpha < 0.5:
+        raise ValueError("alpha must be between zero and 0.5")
 
-        z_alpha = norm.ppf(alpha)
-        var = mu + sigma * z_alpha
-        es = mu - sigma * norm.pdf(z_alpha) / alpha
+    clean = (
+        pd.to_numeric(returns, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+        .astype(float)
+    )
+    if isinstance(clean.index, pd.DatetimeIndex):
+        clean = clean[~clean.index.duplicated(keep="last")].sort_index()
 
-        realized_ret = float(returns.iloc[t])
-        breach = realized_ret < var
-        es_breach = realized_ret < es
+    if len(clean) <= window:
+        return _empty_backtest()
 
-        records.append({
-            "date": returns.index[t],
-            "mu": mu,
-            "sigma": sigma,
-            "sigma2": sigma2,
-            "var": var,
-            "es": es,
-            "breach": breach,
-            "es_breach": es_breach,
-            "ret": realized_ret,
-        })
+    spec = spec or GarchSpec()
+    spec.validate()
+    forecast_function = forecaster or _default_forecaster
+    total_forecasts = len(clean) - window
+    records: list[dict[str, Any]] = []
 
-        if t % 50 == 0:
-            logger.debug(
-                f"  step {t}: date={returns.index[t]}, sigma2={sigma2:.6f}, "
-                f"VaR={var:.6f}, ES={es:.6f}, breach={breach}"
-            )
+    for completed, position in enumerate(range(window, len(clean)), start=1):
+        training_sample = clean.iloc[position - window : position]
+        forecast_date = clean.index[position]
+        try:
+            forecast = forecast_function(training_sample, alpha, spec)
+        except Exception as exc:  # pragma: no cover - exact optimizer failure varies
+            raise BacktestError(
+                f"risk forecast failed for {forecast_date}: {exc}"
+            ) from exc
 
-    df = pd.DataFrame(records)
-    if df.empty or "date" not in df.columns:
-        logger.warning("run_backtest: no records generated (window > data length). Returning empty DataFrame.")
-        return pd.DataFrame(columns=["sigma2", "var", "breach"], index=pd.DatetimeIndex([], name="date"))
-
-    df = df.set_index("date")
-    logger.info(f"run_backtest: completed with {len(df)} rows")
-    return df
-
-def summary_stats(bt_df: pd.DataFrame, alpha: float = 0.05) -> dict:
-    total = len(bt_df)
-    breaches = int(bt_df["breach"].sum()) if total > 0 else 0
-    hit_rate = breaches / total if total > 0 else np.nan
-    expected_breaches = alpha * total
-
-    if total > 0 and 0 < hit_rate < 1:
-        lr_uc = -2.0 * (
-            (total - breaches) * np.log((1 - alpha) / (1 - hit_rate))
-            + breaches * np.log(alpha / hit_rate)
+        realized_return = float(clean.iloc[position])
+        records.append(
+            {
+                "date": forecast_date,
+                "realized_return": realized_return,
+                "conditional_mean": forecast.mean,
+                "variance": forecast.variance,
+                "volatility": forecast.volatility,
+                "var": forecast.var,
+                "expected_shortfall": forecast.expected_shortfall,
+                "breach": bool(realized_return < forecast.var),
+                "es_breach": bool(realized_return < forecast.expected_shortfall),
+            }
         )
-        kupiec_pvalue = 1.0 - chi2.cdf(lr_uc, df=1)
-    else:
-        kupiec_pvalue = np.nan
+        if progress_callback is not None:
+            progress_callback(completed, total_forecasts)
 
-    ci_half = 1.96 * np.sqrt((alpha * (1 - alpha)) / total) if total > 0 else np.nan
-    ci_low = max(0.0, alpha - ci_half) if total > 0 else np.nan
-    ci_high = min(1.0, alpha + ci_half) if total > 0 else np.nan
+    result = pd.DataFrame.from_records(records).set_index("date")
+    if isinstance(clean.index, pd.DatetimeIndex):
+        result.index = pd.DatetimeIndex(result.index, name="date")
+    return result
 
-    stats = {
-        "total_days": int(total),
-        "breaches": int(breaches),
-        "hit_rate": float(hit_rate) if total > 0 else float("nan"),
-        "expected_breaches": float(expected_breaches),
-        "hit_rate_ci_low": float(ci_low) if total > 0 else float("nan"),
-        "hit_rate_ci_high": float(ci_high) if total > 0 else float("nan"),
-        "kupiec_pvalue": float(kupiec_pvalue) if not np.isnan(kupiec_pvalue) else float("nan"),
-        "es_breaches": int(bt_df["es_breach"].sum()) if total > 0 else 0,
+
+def _xlogy(count: int, probability: float) -> float:
+    if count == 0:
+        return 0.0
+    if probability <= 0.0:
+        return -math.inf
+    return count * math.log(probability)
+
+
+def kupiec_unconditional_coverage(
+    breaches: pd.Series | np.ndarray | list[bool],
+    alpha: float,
+) -> dict[str, float | int]:
+    """Kupiec likelihood-ratio test of the unconditional breach frequency."""
+
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between zero and one")
+    values = np.asarray(breaches, dtype=bool)
+    observations = int(values.size)
+    exceptions = int(values.sum())
+    if observations == 0:
+        return {
+            "observations": 0,
+            "exceptions": 0,
+            "exception_rate": math.nan,
+            "lr_stat": math.nan,
+            "p_value": math.nan,
+        }
+
+    empirical_probability = exceptions / observations
+    null_log_likelihood = _xlogy(exceptions, alpha) + _xlogy(
+        observations - exceptions, 1.0 - alpha
+    )
+    alternative_log_likelihood = _xlogy(exceptions, empirical_probability) + _xlogy(
+        observations - exceptions, 1.0 - empirical_probability
+    )
+    lr_stat = max(0.0, -2.0 * (null_log_likelihood - alternative_log_likelihood))
+    return {
+        "observations": observations,
+        "exceptions": exceptions,
+        "exception_rate": empirical_probability,
+        "lr_stat": lr_stat,
+        "p_value": float(chi2.sf(lr_stat, df=1)),
     }
-    logger.info(f"summary_stats: {stats}")
-    return stats
+
+
+def christoffersen_independence(
+    breaches: pd.Series | np.ndarray | list[bool],
+) -> dict[str, float | int]:
+    """Christoffersen likelihood-ratio test for clustered VaR exceptions."""
+
+    values = np.asarray(breaches, dtype=int)
+    if values.size < 2:
+        return {
+            "n00": 0,
+            "n01": 0,
+            "n10": 0,
+            "n11": 0,
+            "lr_stat": math.nan,
+            "p_value": math.nan,
+        }
+
+    previous = values[:-1]
+    current = values[1:]
+    n00 = int(np.sum((previous == 0) & (current == 0)))
+    n01 = int(np.sum((previous == 0) & (current == 1)))
+    n10 = int(np.sum((previous == 1) & (current == 0)))
+    n11 = int(np.sum((previous == 1) & (current == 1)))
+
+    total_transitions = n00 + n01 + n10 + n11
+    unconditional_probability = (n01 + n11) / total_transitions
+    p01 = n01 / (n00 + n01) if (n00 + n01) else 0.0
+    p11 = n11 / (n10 + n11) if (n10 + n11) else 0.0
+
+    independent_log_likelihood = _xlogy(n01 + n11, unconditional_probability) + _xlogy(
+        n00 + n10, 1.0 - unconditional_probability
+    )
+    markov_log_likelihood = (
+        _xlogy(n01, p01)
+        + _xlogy(n00, 1.0 - p01)
+        + _xlogy(n11, p11)
+        + _xlogy(n10, 1.0 - p11)
+    )
+    lr_stat = max(0.0, -2.0 * (independent_log_likelihood - markov_log_likelihood))
+    return {
+        "n00": n00,
+        "n01": n01,
+        "n10": n10,
+        "n11": n11,
+        "lr_stat": lr_stat,
+        "p_value": float(chi2.sf(lr_stat, df=1)),
+    }
+
+
+def summary_stats(backtest: pd.DataFrame, alpha: float) -> dict[str, float | int]:
+    """Summarize forecast accuracy and formal VaR coverage tests."""
+
+    required = {
+        "realized_return",
+        "volatility",
+        "var",
+        "expected_shortfall",
+        "breach",
+    }
+    missing = required - set(backtest.columns)
+    if missing:
+        raise ValueError(f"backtest is missing columns: {sorted(missing)}")
+    if not 0 < alpha < 0.5:
+        raise ValueError("alpha must be between zero and 0.5")
+
+    total = len(backtest)
+    if total == 0:
+        return {
+            "total_days": 0,
+            "breaches": 0,
+            "expected_breaches": 0.0,
+            "breach_rate": math.nan,
+            "expected_rate": alpha,
+            "coverage_ratio": math.nan,
+            "average_daily_volatility": math.nan,
+            "average_annualized_volatility": math.nan,
+            "mean_var_shortfall": math.nan,
+            "mean_es_shortfall": math.nan,
+            "kupiec_lr": math.nan,
+            "kupiec_p_value": math.nan,
+            "independence_lr": math.nan,
+            "independence_p_value": math.nan,
+            "conditional_coverage_lr": math.nan,
+            "conditional_coverage_p_value": math.nan,
+        }
+
+    breach_mask = backtest["breach"].astype(bool)
+    breaches = int(breach_mask.sum())
+    breach_rate = breaches / total
+    kupiec = kupiec_unconditional_coverage(breach_mask, alpha)
+    independence = christoffersen_independence(breach_mask)
+    conditional_lr = float(kupiec["lr_stat"]) + float(independence["lr_stat"])
+
+    var_shortfalls = (
+        backtest.loc[breach_mask, "var"]
+        - backtest.loc[breach_mask, "realized_return"]
+    )
+    es_mask = backtest["realized_return"] < backtest["expected_shortfall"]
+    es_shortfalls = (
+        backtest.loc[es_mask, "expected_shortfall"]
+        - backtest.loc[es_mask, "realized_return"]
+    )
+
+    return {
+        "total_days": total,
+        "breaches": breaches,
+        "expected_breaches": alpha * total,
+        "breach_rate": breach_rate,
+        "expected_rate": alpha,
+        "coverage_ratio": breach_rate / alpha,
+        "average_daily_volatility": float(backtest["volatility"].mean()),
+        "average_annualized_volatility": float(
+            backtest["volatility"].mean() * math.sqrt(252.0)
+        ),
+        "mean_var_shortfall": float(var_shortfalls.mean()) if breaches else 0.0,
+        "mean_es_shortfall": float(es_shortfalls.mean()) if bool(es_mask.any()) else 0.0,
+        "kupiec_lr": float(kupiec["lr_stat"]),
+        "kupiec_p_value": float(kupiec["p_value"]),
+        "independence_lr": float(independence["lr_stat"]),
+        "independence_p_value": float(independence["p_value"]),
+        "conditional_coverage_lr": conditional_lr,
+        "conditional_coverage_p_value": float(chi2.sf(conditional_lr, df=2)),
+    }
