@@ -93,3 +93,76 @@ def test_polygon_fetch_paginates_and_normalizes():
 def test_polygon_requires_key():
     with pytest.raises(DataProviderError, match="API key"):
         fetch_data("AAPL", "2024-01-01", "2024-01-02", api_key="")
+
+
+def _single_page_session() -> FakeSession:
+    return FakeSession(
+        [
+            FakeResponse(
+                {
+                    "results": [
+                        {
+                            "t": 1704067200000,
+                            "o": 99,
+                            "h": 102,
+                            "l": 98,
+                            "c": 100,
+                            "v": 10,
+                        }
+                    ]
+                }
+            )
+        ]
+    )
+
+
+def test_polygon_uses_environment_key_when_argument_is_omitted(monkeypatch):
+    monkeypatch.setenv("POLYGON_API_KEY", "environment-key")
+    session = _single_page_session()
+
+    fetch_data("AAPL", "2024-01-01", "2024-01-01", session=session)  # type: ignore[arg-type]
+
+    assert session.calls[0][1]["apiKey"] == "environment-key"
+
+
+def test_polygon_explicit_key_wins_over_environment(monkeypatch):
+    monkeypatch.setenv("POLYGON_API_KEY", "environment-key")
+    session = _single_page_session()
+
+    fetch_data(  # type: ignore[arg-type]
+        "AAPL",
+        "2024-01-01",
+        "2024-01-01",
+        api_key=" explicit-key ",
+        session=session,
+    )
+
+    assert session.calls[0][1]["apiKey"] == "explicit-key"
+
+
+@pytest.mark.parametrize("explicit_key", ["", "   \t"])
+def test_polygon_explicit_blank_key_does_not_fall_back_to_environment(
+    monkeypatch, explicit_key
+):
+    monkeypatch.setenv("POLYGON_API_KEY", "environment-key")
+
+    with pytest.raises(DataProviderError, match="API key"):
+        fetch_data("AAPL", "2024-01-01", "2024-01-01", api_key=explicit_key)
+
+
+def test_polygon_errors_do_not_expose_api_key():
+    api_key = "top-secret-api-key"
+    session = FakeSession(
+        [FakeResponse({"message": f"Invalid apiKey={api_key}"}, status_code=401)]
+    )
+
+    with pytest.raises(DataProviderError) as exc_info:
+        fetch_data(  # type: ignore[arg-type]
+            "AAPL",
+            "2024-01-01",
+            "2024-01-01",
+            api_key=api_key,
+            session=session,
+        )
+
+    assert api_key not in str(exc_info.value)

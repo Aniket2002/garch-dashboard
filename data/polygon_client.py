@@ -61,12 +61,14 @@ def _validate_request(symbol: str, start: str, end: str) -> tuple[str, str, str]
     )
 
 
-def _response_message(response: requests.Response) -> str:
+def _response_message(response: requests.Response, *, secret: str) -> str:
     try:
         payload = response.json()
     except ValueError:
-        return response.text[:300]
-    return str(payload.get("message") or payload.get("error") or payload)[:300]
+        message = response.text[:300]
+    else:
+        message = str(payload.get("message") or payload.get("error") or payload)[:300]
+    return message.replace(secret, "[REDACTED]")
 
 
 def fetch_data(
@@ -81,8 +83,8 @@ def fetch_data(
 ) -> pd.DataFrame:
     """Fetch adjusted daily Polygon aggregates with pagination and retries.
 
-    The API key is read from the explicit argument first and then from
-    ``POLYGON_API_KEY``. It is never written to logs or returned in exceptions.
+    ``POLYGON_API_KEY`` is used only when ``api_key`` is omitted. An explicitly
+    blank key is invalid. Keys are never written to logs or returned in errors.
     """
 
     if timeout <= 0:
@@ -91,7 +93,8 @@ def fetch_data(
         raise ValueError("max_pages must be positive")
 
     normalized_symbol, start_date, end_date = _validate_request(symbol, start, end)
-    resolved_key = api_key or os.getenv("POLYGON_API_KEY")
+    key_candidate = os.getenv("POLYGON_API_KEY") if api_key is None else api_key
+    resolved_key = key_candidate.strip() if key_candidate else ""
     if not resolved_key:
         raise DataProviderError(
             "Polygon API key is missing. Set POLYGON_API_KEY or provide a key in the dashboard."
@@ -111,18 +114,21 @@ def fetch_data(
     rows: list[dict[str, Any]] = []
 
     for _ in range(max_pages):
-        response = client.get(url, params=params, timeout=timeout)
+        try:
+            response = client.get(url, params=params, timeout=timeout)
+        except requests.RequestException as exc:
+            raise DataProviderError("Polygon request failed due to a network error") from exc
         if response.status_code in {401, 403}:
             raise DataProviderError(
                 f"Polygon rejected the request ({response.status_code}): "
-                f"{_response_message(response)}"
+                f"{_response_message(response, secret=resolved_key)}"
             )
         if response.status_code == 429:
             raise DataProviderError("Polygon rate limit was exceeded after retry attempts")
         if not response.ok:
             raise DataProviderError(
                 f"Polygon request failed ({response.status_code}): "
-                f"{_response_message(response)}"
+                f"{_response_message(response, secret=resolved_key)}"
             )
 
         try:

@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import pytest
-from arch.univariate.distribution import Normal
-from scipy.stats import norm
+from arch.univariate.distribution import Normal, StudentsT
+from scipy.stats import norm, t
 
 from models.garch_model import (
     GarchSpec,
@@ -18,9 +18,9 @@ from models.garch_model import (
 
 
 class FakeResult:
-    def __init__(self) -> None:
-        self.model = SimpleNamespace(distribution=Normal())
-        self.params = pd.Series(dtype=float)
+    def __init__(self, distribution=None, params=None) -> None:
+        self.model = SimpleNamespace(distribution=distribution or Normal())
+        self.params = pd.Series(params or {}, dtype=float)
 
     def forecast(self, horizon: int, reindex: bool):
         assert horizon == 1
@@ -45,6 +45,59 @@ def test_normal_tail_forecast_matches_closed_form():
         0.01 + 0.02 * expected_tail_mean
     )
     assert forecast.expected_shortfall < forecast.var
+
+
+def test_student_t_tail_forecast_uses_unit_variance_standardization():
+    alpha = 0.025
+    degrees_of_freedom = 8.0
+    forecast = forecast_tail_risk(
+        FakeResult(StudentsT(), {"nu": degrees_of_freedom}), alpha
+    )
+    scale = np.sqrt((degrees_of_freedom - 2.0) / degrees_of_freedom)
+    raw_quantile = t.ppf(alpha, degrees_of_freedom)
+    standardized_quantile = scale * raw_quantile
+    standardized_tail_mean = (
+        -scale
+        * (degrees_of_freedom + raw_quantile**2)
+        / (degrees_of_freedom - 1.0)
+        * t.pdf(raw_quantile, degrees_of_freedom)
+        / alpha
+    )
+
+    assert forecast.innovation_quantile == pytest.approx(standardized_quantile)
+    assert forecast.innovation_expected_shortfall == pytest.approx(
+        standardized_tail_mean
+    )
+    assert forecast.var == pytest.approx(0.01 + 0.02 * standardized_quantile)
+    assert forecast.expected_shortfall == pytest.approx(
+        0.01 + 0.02 * standardized_tail_mean
+    )
+    assert forecast.expected_shortfall <= forecast.var
+
+
+def test_fit_garch_scales_decimal_returns_to_percent(monkeypatch):
+    captured = {}
+    fitted_result = SimpleNamespace(convergence_flag=0)
+
+    class FakeModel:
+        def fit(self, *, disp: str, show_warning: bool):
+            assert disp == "off"
+            assert show_warning is False
+            return fitted_result
+
+    def fake_arch_model(series, **kwargs):
+        captured["series"] = series
+        captured["kwargs"] = kwargs
+        return FakeModel()
+
+    monkeypatch.setattr("models.garch_model.arch_model", fake_arch_model)
+    returns = pd.Series([0.01, -0.02, 0.005])
+
+    result = fit_garch(returns, minimum_observations=3)
+
+    pd.testing.assert_series_equal(captured["series"], returns * 100.0)
+    assert captured["kwargs"]["rescale"] is False
+    assert result is fitted_result
 
 
 def test_clean_returns_rejects_constant_or_too_short_series():
